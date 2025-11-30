@@ -164,14 +164,14 @@ class ClickhouseDatabase(BaseDatabase):
 
         self._client.execute(sql, data)
 
-        # 更新K线汇总数据（增量更新）
+        # 更新K线汇总数据
         if bars:
             symbol = bars[0].symbol
             exchange = bars[0].exchange.value
             interval = bars[0].interval.value
 
             # 查询当前汇总值（FINAL 保证读到最新值）
-            current = self._client.execute(
+            overview = self._client.execute(
                 """
                 SELECT count, start, end
                 FROM dbbaroverview FINAL
@@ -182,17 +182,35 @@ class ClickhouseDatabase(BaseDatabase):
                 {"symbol": symbol, "exchange": exchange, "interval": interval},
             )
             
-            if current:
-                # 已存在：增量更新
-                old_count, old_start, old_end = current[0]
-                new_count = old_count + len(bars)
-                new_start = old_start  # start 不变
-                new_end = max(old_end, bars[-1].datetime)
-            else:
+            if not overview:
                 # 首次插入
                 new_count = len(bars)
                 new_start = bars[0].datetime
                 new_end = bars[-1].datetime
+            elif stream:
+                # 流式数据（实时行情）：增量更新
+                old_count, old_start, old_end = overview[0]
+                new_count = old_count + len(bars)
+                new_start = old_start  # start 不变
+                new_end = max(old_end, bars[-1].datetime)
+            else:
+                # 历史数据回填：重新计算精确count
+                old_count, old_start, old_end = overview[0]
+                new_start = min(bars[0].datetime, old_start)
+                new_end = max(bars[-1].datetime, old_end)
+                
+                # 查询数据库获取精确count（加 FINAL 确保去重后的准确值）
+                count_result = self._client.execute(
+                    """
+                    SELECT count()
+                    FROM dbbardata FINAL
+                    WHERE symbol = %(symbol)s
+                      AND exchange = %(exchange)s
+                      AND interval = %(interval)s
+                    """,
+                    {"symbol": symbol, "exchange": exchange, "interval": interval},
+                )
+                new_count = count_result[0][0]
             
             # 插入新的汇总记录（ReplacingMergeTree 会在后台合并）
             self._client.execute(
@@ -293,13 +311,13 @@ class ClickhouseDatabase(BaseDatabase):
 
         self._client.execute(sql, data)
 
-        # 更新Tick汇总数据（增量更新）
+        # 更新Tick汇总数据
         if ticks:
             symbol = ticks[0].symbol
             exchange = ticks[0].exchange.value
 
             # 查询当前汇总值（FINAL 保证读到最新值）
-            current = self._client.execute(
+            overview = self._client.execute(
                 """
                 SELECT count, start, end
                 FROM dbtickoverview FINAL
@@ -309,17 +327,34 @@ class ClickhouseDatabase(BaseDatabase):
                 {"symbol": symbol, "exchange": exchange},
             )
             
-            if current:
-                # 已存在：增量更新
-                old_count, old_start, old_end = current[0]
-                new_count = old_count + len(ticks)
-                new_start = old_start  # start 不变
-                new_end = max(old_end, ticks[-1].datetime)
-            else:
+            if not overview:
                 # 首次插入
                 new_count = len(ticks)
                 new_start = ticks[0].datetime
                 new_end = ticks[-1].datetime
+            elif stream:
+                # 流式数据（实时行情）：增量更新
+                old_count, old_start, old_end = overview[0]
+                new_count = old_count + len(ticks)
+                new_start = old_start  # start 不变
+                new_end = max(old_end, ticks[-1].datetime)
+            else:
+                # 历史数据回填：重新计算精确count
+                old_count, old_start, old_end = overview[0]
+                new_start = min(ticks[0].datetime, old_start)
+                new_end = max(ticks[-1].datetime, old_end)
+                
+                # 查询数据库获取精确count（加 FINAL 确保去重后的准确值）
+                count_result = self._client.execute(
+                    """
+                    SELECT count()
+                    FROM dbtickdata FINAL
+                    WHERE symbol = %(symbol)s
+                      AND exchange = %(exchange)s
+                    """,
+                    {"symbol": symbol, "exchange": exchange},
+                )
+                new_count = count_result[0][0]
             
             # 插入新的汇总记录（ReplacingMergeTree 会在后台合并）
             self._client.execute(
