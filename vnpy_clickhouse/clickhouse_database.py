@@ -26,9 +26,9 @@ BARDATA_CREATE_SQL = """
         open_price Float64,     -- 开盘价
         high_price Float64,     -- 最高价
         low_price Float64,      -- 最低价
-        close_price Float64,    -- 收盘价
-        created_at DateTime DEFAULT now()  -- 创建时间
-    ) ENGINE = MergeTree()
+        close_price Float64     -- 收盘价
+    ) ENGINE = ReplacingMergeTree()
+    PARTITION BY toYYYYMM(datetime)
     ORDER BY (symbol, exchange, interval, datetime)
 """
 
@@ -69,9 +69,9 @@ TICKDATA_CREATE_SQL = """
         ask_volume_2 Float64,   -- 卖二量
         ask_volume_3 Float64,   -- 卖三量
         ask_volume_4 Float64,   -- 卖四量
-        ask_volume_5 Float64,   -- 卖五量
-        created_at DateTime DEFAULT now()  -- 创建时间
-    ) ENGINE = MergeTree()
+        ask_volume_5 Float64    -- 卖五量
+    ) ENGINE = ReplacingMergeTree()
+    PARTITION BY toYYYYMM(datetime)
     ORDER BY (symbol, exchange, datetime)
 """
 
@@ -83,10 +83,8 @@ BAROVERVIEW_CREATE_SQL = """
         interval String,         -- 周期
         count Int64,            -- 数据条数
         start DateTime,         -- 开始时间
-        end DateTime,           -- 结束时间
-        created_at DateTime DEFAULT now(),  -- 创建时间
-        updated_at DateTime DEFAULT now()   -- 更新时间
-    ) ENGINE = ReplacingMergeTree(updated_at)
+        end DateTime            -- 结束时间
+    ) ENGINE = ReplacingMergeTree()
     ORDER BY (symbol, exchange, interval)
 """
 
@@ -97,10 +95,8 @@ TICKOVERVIEW_CREATE_SQL = """
         exchange String,         -- 交易所
         count Int64,            -- 数据条数
         start DateTime,         -- 开始时间
-        end DateTime,           -- 结束时间
-        created_at DateTime DEFAULT now(),  -- 创建时间
-        updated_at DateTime DEFAULT now()   -- 更新时间
-    ) ENGINE = ReplacingMergeTree(updated_at)
+        end DateTime            -- 结束时间
+    ) ENGINE = ReplacingMergeTree()
     ORDER BY (symbol, exchange)
 """
 
@@ -168,36 +164,40 @@ class ClickhouseDatabase(BaseDatabase):
 
         self._client.execute(sql, data)
 
-        # 更新K线汇总数据
+        # 更新K线汇总数据（增量更新）
         if bars:
             symbol = bars[0].symbol
             exchange = bars[0].exchange.value
             interval = bars[0].interval.value
 
-            # 直接插入汇总数据，ReplacingMergeTree会自动处理重复
-            overview_sql = """
-                INSERT INTO dbbaroverview (
-                    symbol, exchange, interval, count, start, end, created_at, updated_at
-                )
-                SELECT 
-                    symbol,
-                    exchange,
-                    interval,
-                    count() as count,
-                    min(datetime) as start,
-                    max(datetime) as end,
-                    now() as created_at,
-                    now() as updated_at
-                FROM dbbardata
-                WHERE symbol = %(symbol)s 
-                    AND exchange = %(exchange)s 
-                    AND interval = %(interval)s
-                GROUP BY symbol, exchange, interval
-            """
-
-            self._client.execute(
-                overview_sql,
+            # 查询当前汇总值（FINAL 保证读到最新值）
+            current = self._client.execute(
+                """
+                SELECT count, start, end
+                FROM dbbaroverview FINAL
+                WHERE symbol = %(symbol)s
+                  AND exchange = %(exchange)s
+                  AND interval = %(interval)s
+                """,
                 {"symbol": symbol, "exchange": exchange, "interval": interval},
+            )
+            
+            if current:
+                # 已存在：增量更新
+                old_count, old_start, old_end = current[0]
+                new_count = old_count + len(bars)
+                new_start = old_start  # start 不变
+                new_end = max(old_end, bars[-1].datetime)
+            else:
+                # 首次插入
+                new_count = len(bars)
+                new_start = bars[0].datetime
+                new_end = bars[-1].datetime
+            
+            # 插入新的汇总记录（ReplacingMergeTree 会在后台合并）
+            self._client.execute(
+                "INSERT INTO dbbaroverview (symbol, exchange, interval, count, start, end) VALUES",
+                [[symbol, exchange, interval, new_count, new_start, new_end]]
             )
 
         return True
@@ -293,31 +293,39 @@ class ClickhouseDatabase(BaseDatabase):
 
         self._client.execute(sql, data)
 
-        # 更新Tick汇总数据
+        # 更新Tick汇总数据（增量更新）
         if ticks:
             symbol = ticks[0].symbol
             exchange = ticks[0].exchange.value
 
-            # 直接插入汇总数据，ReplacingMergeTree会自动处理重复
-            overview_sql = """
-                INSERT INTO dbtickoverview (
-                    symbol, exchange, count, start, end, created_at, updated_at
-                )
-                SELECT 
-                    symbol,
-                    exchange,
-                    count() as count,
-                    min(datetime) as start,
-                    max(datetime) as end,
-                    now() as created_at,
-                    now() as updated_at
-                FROM dbtickdata
-                WHERE symbol = %(symbol)s 
-                    AND exchange = %(exchange)s
-                GROUP BY symbol, exchange
-            """
-
-            self._client.execute(overview_sql, {"symbol": symbol, "exchange": exchange})
+            # 查询当前汇总值（FINAL 保证读到最新值）
+            current = self._client.execute(
+                """
+                SELECT count, start, end
+                FROM dbtickoverview FINAL
+                WHERE symbol = %(symbol)s
+                  AND exchange = %(exchange)s
+                """,
+                {"symbol": symbol, "exchange": exchange},
+            )
+            
+            if current:
+                # 已存在：增量更新
+                old_count, old_start, old_end = current[0]
+                new_count = old_count + len(ticks)
+                new_start = old_start  # start 不变
+                new_end = max(old_end, ticks[-1].datetime)
+            else:
+                # 首次插入
+                new_count = len(ticks)
+                new_start = ticks[0].datetime
+                new_end = ticks[-1].datetime
+            
+            # 插入新的汇总记录（ReplacingMergeTree 会在后台合并）
+            self._client.execute(
+                "INSERT INTO dbtickoverview (symbol, exchange, count, start, end) VALUES",
+                [[symbol, exchange, new_count, new_start, new_end]]
+            )
 
         return True
 
@@ -331,11 +339,11 @@ class ClickhouseDatabase(BaseDatabase):
     ) -> List[BarData]:
         """从数据库加载K线数据"""
         sql = """
-            SELECT 
+            SELECT
                 symbol, exchange, datetime, interval,
                 volume, turnover, open_interest,
                 open_price, high_price, low_price, close_price
-            FROM dbbardata
+            FROM dbbardata FINAL
             WHERE symbol = %(symbol)s
                 AND exchange = %(exchange)s
                 AND interval = %(interval)s
@@ -379,7 +387,7 @@ class ClickhouseDatabase(BaseDatabase):
     ) -> List[TickData]:
         """从数据库加载Tick数据"""
         sql = """
-            SELECT 
+            SELECT
                 symbol, exchange, datetime, name,
                 volume, turnover, open_interest,
                 last_price, last_volume,
@@ -389,7 +397,7 @@ class ClickhouseDatabase(BaseDatabase):
                 ask_price_1, ask_price_2, ask_price_3, ask_price_4, ask_price_5,
                 bid_volume_1, bid_volume_2, bid_volume_3, bid_volume_4, bid_volume_5,
                 ask_volume_1, ask_volume_2, ask_volume_3, ask_volume_4, ask_volume_5
-            FROM dbtickdata
+            FROM dbtickdata FINAL
             WHERE symbol = %(symbol)s
                 AND exchange = %(exchange)s
                 AND datetime >= %(start)s
