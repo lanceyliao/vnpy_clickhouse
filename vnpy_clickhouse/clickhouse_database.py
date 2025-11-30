@@ -483,6 +483,7 @@ class ClickhouseDatabase(BaseDatabase):
                 ask_volume_3=row[32],
                 ask_volume_4=row[33],
                 ask_volume_5=row[34],
+                gateway_name="DB",
             )
             ticks.append(tick)
         return ticks
